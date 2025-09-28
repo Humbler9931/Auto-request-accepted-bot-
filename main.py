@@ -27,9 +27,8 @@ CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Advanced Community")
 RULES_LINK = os.getenv("RULES_LINK", "https://t.me/narzoxbot")
 SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/narzoxbot")
 
-# Render Web Server Configuration
+# Render Web Server Configuration (PORT environment se aayega)
 WEB_HOST = os.getenv("HOST", "0.0.0.0")
-# Render environment se PORT uthana
 WEB_PORT = int(os.getenv("PORT", 8080)) 
 
 # ID ko integer mein convert karna
@@ -44,8 +43,9 @@ TARGET_FILTER = filters.chat(CHANNEL_ID) if CHANNEL_ID else filters.all
 CHANNEL_LINK = f"https://t.me/{MANDATORY_CHANNEL.strip('@')}"
 
 # --- Pyrogram Client Initialization ---
-# Ab hum client ko globally initialize karenge, lekin start async function mein hoga
 try:
+    # Client ko ab hum 'main' function mein define aur start karenge
+    # taaki FastAPI ke loop mein conflict na ho
     app = Client(
         "auto_approver_session",
         api_id=int(API_ID),
@@ -53,26 +53,24 @@ try:
         bot_token=BOT_TOKEN
     )
 except Exception as e:
-    log.error(f"Client Initialization Failed: Check API_ID/HASH/TOKEN. Error: {e}")
+    log.error(f"Client Initialization Failed: {e}")
     exit(1)
 
-# --- FastAPI App Initialization ---
+# --- FastAPI App Initialization (Render Health Check ke liye) ---
 web_app = FastAPI()
 
 @web_app.get("/", tags=["Health Check"])
 def home():
-    """Render ko dikhane ke liye ki service chal rahi hai."""
-    return {"status": "Bot is operational (Pyrogram Client mode active)."}
+    """Render ko '200 OK' response deta hai taaki woh jaane ki service chal rahi hai."""
+    return {"status": "Bot is operational (Hybrid Mode Active)."}
 
-# --- HANDLERS (Same as before, sirf 'client' ki jagah 'app' use kiya gaya) ---
+# --- HANDLERS (Same as before) ---
 
 # START MESSAGE DEFINITIONS
 START_MESSAGE = (
     "👋 **Namaste {user_name}!** Main **{bot_name}** hoon.\n\n"
     "🤖 **Mera Kaam:** Main aapki community **{channel_name}** ka *Gatekeeper* hoon. "
-    "Mera mukhya (primary) kaam **Channel Join Requests** ko turant (instantly) **Approve** karna hai, "
-    "taaki aap bina deri ke community mein daakhil (enter) ho saken.\n\n"
-    "**✨ Multi-Features:** Niche diye gaye buttons se aap *Rules*, *Support* aur *Channel Links* dekh sakte hain."
+    "Mera mukhya (primary) kaam **Channel Join Requests** ko turant (instantly) **Approve** karna hai.\n"
 )
 
 START_KEYBOARD = InlineKeyboardMarkup([
@@ -170,16 +168,16 @@ async def handle_join_request(client: Client, update: ChatJoinRequest):
         log.info(f"✉️ PM sent to user: {user.first_name}")
 
     except Exception:
-        log.warning(f"⚠️ PM FAILED for {user.first_name} (Not started bot).")
+        log.warning(f"⚠️ PM FAILED for {user.first_name} (Not started bot or privacy settings).")
 
 
 # --- Main Execution Block for Hybrid Mode ---
 
 async def run_bot_and_server():
-    """Pyrogram client aur FastAPI server ko ek saath chalata hai."""
+    """Pyrogram client aur Uvicorn server ko ek hi loop mein chalaana."""
     
     log.info("🚀 Pyrogram Client starting...")
-    # Pyrogram client ko shuru karne ka task
+    # Pyrogram client ko shuru karna
     await app.start()
 
     log.info("🌟 Pyrogram Client Started Successfully!")
@@ -196,18 +194,20 @@ async def run_bot_and_server():
     
     log.info(f"🌐 Starting Uvicorn Web Server on {WEB_HOST}:{WEB_PORT} (Render Health Check)")
     
-    # Uvicorn server ko ek alag task ke roop mein chalana
+    # Uvicorn server ko shuru karna (Blocking call, isliye yeh main task hona chahiye)
+    # Pyrogram app.idle() ki jagah server.serve() chalayenge
     await server.serve()
-    
-    # Pyrogram client ko tab tak chalate rehna jab tak server chalta hai
-    await app.idle()
 
 
 if __name__ == "__main__":
     try:
         log.info("--- STARTING HYBRID BOT SERVICE ---")
+        # Pure code ko asyncio.run mein daalna loop conflict se bachaata hai
         asyncio.run(run_bot_and_server())
     except KeyboardInterrupt:
         log.info("Bot Stopped by User.")
     except Exception as e:
-        log.error(f"A FATAL ERROR occurred in main execution: {e}")
+        # Client stop karna zaroori hai agar koi error aaye
+        if app.is_running:
+            asyncio.run(app.stop())
+        log.error(f"A FATAL ERROR occurred: {e}")
