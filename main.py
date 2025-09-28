@@ -1,8 +1,10 @@
 import os
 import logging
 import asyncio
+import sys # Naya import
 from dotenv import load_dotenv
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait # Naya import
 from pyrogram.types import ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardButton
 from fastapi import FastAPI
 import uvicorn
@@ -17,46 +19,58 @@ log = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Environment Variables
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN") 
-CHANNEL_ID_STR = os.getenv("CHANNEL_ID")
-MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "@narzoxbot")
-CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Advanced Community")
-RULES_LINK = os.getenv("RULES_LINK", "https://t.me/narzoxbot")
-SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/narzoxbot")
-
-# Render Web Server Configuration (PORT environment se aayega)
-WEB_HOST = os.getenv("HOST", "0.0.0.0")
-WEB_PORT = int(os.getenv("PORT", 8080)) 
-
-# ID ko integer mein convert karna
+# --- Environment Variables Fetching aur Validation (FloodWait ke liye zaroori) ---
 try:
+    # API_ID ko integer mein convert karte samay error check karna
+    API_ID = int(os.getenv("API_ID"))
+    API_HASH = os.getenv("API_HASH")
+    BOT_TOKEN = os.getenv("BOT_TOKEN") 
+    
+    if not API_ID or not API_HASH or not BOT_TOKEN:
+        log.error("❌ Zaroori Environment Variables missing. Check .env/Render settings.")
+        sys.exit(1)
+
+    CHANNEL_ID_STR = os.getenv("CHANNEL_ID")
+    MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "@narzoxbot")
+    CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Advanced Community")
+    RULES_LINK = os.getenv("RULES_LINK", "https://t.me/narzoxbot")
+    SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/narzoxbot")
+
+    # Render Web Server Configuration
+    WEB_HOST = os.getenv("HOST", "0.0.0.0")
+    WEB_PORT = int(os.getenv("PORT", 8080)) 
+
+    # ID ko integer mein convert karna
     CHANNEL_ID = int(CHANNEL_ID_STR) if CHANNEL_ID_STR else None
+
 except ValueError:
-    log.error("CHANNEL_ID is not a valid integer. Check .env.")
-    CHANNEL_ID = None
+    log.error("❌ API_ID or CHANNEL_ID is not a valid integer. Deployment stopped.")
+    sys.exit(1)
+except Exception as e:
+    log.error(f"❌ Critical Environment Error: {e}")
+    sys.exit(1)
+
 
 # Filters
 TARGET_FILTER = filters.chat(CHANNEL_ID) if CHANNEL_ID else filters.all
 CHANNEL_LINK = f"https://t.me/{MANDATORY_CHANNEL.strip('@')}"
 
-# --- Pyrogram Client Initialization ---
+# --- 🎯 Pyrogram Client Initialization (FloodWait Fix) ---
 try:
-    # Client ko ab hum 'main' function mein define aur start karenge
-    # taaki FastAPI ke loop mein conflict na ho
+    # FloodWait ko automatic handle karne ke liye 'sleep_threshold' set kiya gaya hai.
     app = Client(
         "auto_approver_session",
-        api_id=int(API_ID),
+        api_id=API_ID,
         api_hash=API_HASH,
-        bot_token=BOT_TOKEN
+        bot_token=BOT_TOKEN,
+        sleep_threshold=60  # Bot 60 seconds tak ki FloodWait ko khud hi handle karega
     )
+    log.info("✅ Pyrogram Client object initialized.")
 except Exception as e:
-    log.error(f"Client Initialization Failed: {e}")
-    exit(1)
+    log.error(f"❌ Pyrogram Initialization Failed: {e}")
+    sys.exit(1)
 
-# --- FastAPI App Initialization (Render Health Check ke liye) ---
+# --- FastAPI App Initialization (Render Health Check) ---
 web_app = FastAPI()
 
 @web_app.get("/", tags=["Health Check"])
@@ -66,7 +80,7 @@ def home():
 
 # --- HANDLERS (Same as before) ---
 
-# START MESSAGE DEFINITIONS
+# START MESSAGE DEFINITIONS... (Handlers ka code yahan aayega)
 START_MESSAGE = (
     "👋 **Namaste {user_name}!** Main **{bot_name}** hoon.\n\n"
     "🤖 **Mera Kaam:** Main aapki community **{channel_name}** ka *Gatekeeper* hoon. "
@@ -86,17 +100,20 @@ START_KEYBOARD = InlineKeyboardMarkup([
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message):
-    bot_info = await app.get_me()
-    await message.reply_text(
-        START_MESSAGE.format(
-            user_name=message.from_user.first_name,
-            bot_name=bot_info.first_name,
-            channel_name=CHANNEL_NAME
-        ),
-        reply_markup=START_KEYBOARD,
-        parse_mode="markdown"
-    )
-    log.info(f"Start command received from user: {message.from_user.id}")
+    try:
+        bot_info = await app.get_me()
+        await message.reply_text(
+            START_MESSAGE.format(
+                user_name=message.from_user.first_name,
+                bot_name=bot_info.first_name,
+                channel_name=CHANNEL_NAME
+            ),
+            reply_markup=START_KEYBOARD,
+            parse_mode="markdown"
+        )
+        log.info(f"Start command received from user: {message.from_user.id}")
+    except Exception as e:
+        log.error(f"Error in start_handler: {e}")
 
 @app.on_callback_query(filters.regex("status_check"))
 async def status_checker(_, callback_query):
@@ -135,6 +152,7 @@ async def handle_join_request(client: Client, update: ChatJoinRequest):
         log.info(f"✅ SUCCESSFULLY APPROVED: {user.first_name}")
 
     except Exception as e:
+        # Permission error aane par yahan ruk jayega
         log.error(f"❌ APPROVAL FAILED: Check Bot Permissions (Add Members) in {chat.title}. Error: {e}")
         return 
         
@@ -170,8 +188,7 @@ async def handle_join_request(client: Client, update: ChatJoinRequest):
     except Exception:
         log.warning(f"⚠️ PM FAILED for {user.first_name} (Not started bot or privacy settings).")
 
-
-# --- Main Execution Block for Hybrid Mode ---
+# --- Main Execution Block for Hybrid Mode (is_running Fix) ---
 
 async def run_bot_and_server():
     """Pyrogram client aur Uvicorn server ko ek hi loop mein chalaana."""
@@ -194,20 +211,20 @@ async def run_bot_and_server():
     
     log.info(f"🌐 Starting Uvicorn Web Server on {WEB_HOST}:{WEB_PORT} (Render Health Check)")
     
-    # Uvicorn server ko shuru karna (Blocking call, isliye yeh main task hona chahiye)
-    # Pyrogram app.idle() ki jagah server.serve() chalayenge
+    # Uvicorn server ko shuru karna (Blocking call)
     await server.serve()
 
 
 if __name__ == "__main__":
     try:
         log.info("--- STARTING HYBRID BOT SERVICE ---")
-        # Pure code ko asyncio.run mein daalna loop conflict se bachaata hai
+        # asyncio.run(run_bot_and_server()) yeh loop conflict se bachata hai.
         asyncio.run(run_bot_and_server())
     except KeyboardInterrupt:
         log.info("Bot Stopped by User.")
     except Exception as e:
-        # Client stop karna zaroori hai agar koi error aaye
-        if app.is_running:
-            asyncio.run(app.stop())
         log.error(f"A FATAL ERROR occurred: {e}")
+        # Final cleanup: Error aane par client ko sahi tarah se stop karna
+        if app.is_running:
+            log.info("Stopping Pyrogram client on error...")
+            asyncio.run(app.stop()) 
