@@ -6,6 +6,7 @@ from pyrogram import Client, filters
 from pyrogram.types import ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardButton
 from fastapi import FastAPI
 import uvicorn
+from uvicorn.config import Config
 
 # --- Configuration & Logging Setup ---
 logging.basicConfig(
@@ -26,22 +27,24 @@ CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Advanced Community")
 RULES_LINK = os.getenv("RULES_LINK", "https://t.me/narzoxbot")
 SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/narzoxbot")
 
-# Render environment se PORT uthana zaroori hai
+# Render Web Server Configuration
 WEB_HOST = os.getenv("HOST", "0.0.0.0")
-WEB_PORT = int(os.getenv("PORT", 8080)) # Render yeh PORT environment variable se deta hai
+# Render environment se PORT uthana
+WEB_PORT = int(os.getenv("PORT", 8080)) 
 
 # ID ko integer mein convert karna
 try:
     CHANNEL_ID = int(CHANNEL_ID_STR) if CHANNEL_ID_STR else None
 except ValueError:
-    log.error("CHANNEL_ID is not a valid integer. Please check your .env file.")
+    log.error("CHANNEL_ID is not a valid integer. Check .env.")
     CHANNEL_ID = None
 
 # Filters
 TARGET_FILTER = filters.chat(CHANNEL_ID) if CHANNEL_ID else filters.all
 CHANNEL_LINK = f"https://t.me/{MANDATORY_CHANNEL.strip('@')}"
 
-# --- Pyrogram Client Initialization (Globally) ---
+# --- Pyrogram Client Initialization ---
+# Ab hum client ko globally initialize karenge, lekin start async function mein hoga
 try:
     app = Client(
         "auto_approver_session",
@@ -50,20 +53,20 @@ try:
         bot_token=BOT_TOKEN
     )
 except Exception as e:
-    log.error(f"Client Initialization Failed: {e}")
+    log.error(f"Client Initialization Failed: Check API_ID/HASH/TOKEN. Error: {e}")
     exit(1)
 
 # --- FastAPI App Initialization ---
-# FastAPI ka istemal sirf Render ko 'PORT' par web service chalane ke liye signal dene ke liye
 web_app = FastAPI()
 
-@web_app.get("/")
+@web_app.get("/", tags=["Health Check"])
 def home():
-    """Render health check ke liye simple endpoint."""
-    return {"status": "Bot is running on Pyrogram Client mode and Web server is active."}
+    """Render ko dikhane ke liye ki service chal rahi hai."""
+    return {"status": "Bot is operational (Pyrogram Client mode active)."}
 
-# --- 🌟 ADVANCED START MENU & KEYBOARDS (SAME AS BEFORE) ---
+# --- HANDLERS (Same as before, sirf 'client' ki jagah 'app' use kiya gaya) ---
 
+# START MESSAGE DEFINITIONS
 START_MESSAGE = (
     "👋 **Namaste {user_name}!** Main **{bot_name}** hoon.\n\n"
     "🤖 **Mera Kaam:** Main aapki community **{channel_name}** ka *Gatekeeper* hoon. "
@@ -97,14 +100,11 @@ async def start_handler(_, message):
     )
     log.info(f"Start command received from user: {message.from_user.id}")
 
-# --- CALLBACK QUERY HANDLER (For Status Check Button) ---
 @app.on_callback_query(filters.regex("status_check"))
 async def status_checker(_, callback_query):
     await callback_query.answer("🚀 Bot is Active and Serving! Auto-approval system chal raha hai.", show_alert=True)
 
-
-# --- 👑 AUTO APPROVAL FEATURE (Join Request) ---
-
+# AUTO APPROVAL HANDLER
 WELCOME_TO_CHANNEL_TEXT = (
     "**⚜️ APPROVED!** {user_name}, aapka swagat hai **{channel_name}** mein! 🚀\n\n"
     "Aapka request turant **Auto-Approved** ho gaya hai.\n"
@@ -173,32 +173,41 @@ async def handle_join_request(client: Client, update: ChatJoinRequest):
         log.warning(f"⚠️ PM FAILED for {user.first_name} (Not started bot).")
 
 
-# --- Main Execution Block ---
+# --- Main Execution Block for Hybrid Mode ---
 
 async def run_bot_and_server():
     """Pyrogram client aur FastAPI server ko ek saath chalata hai."""
     
-    # Pyrogram Client ko start karo
+    log.info("🚀 Pyrogram Client starting...")
+    # Pyrogram client ko shuru karne ka task
     await app.start()
-    log.info("🌟 Pyrogram Client Started!")
+
+    log.info("🌟 Pyrogram Client Started Successfully!")
 
     # Uvicorn Web Server ki configuration
-    config = uvicorn.Config(web_app, host=WEB_HOST, port=WEB_PORT, log_level="info")
-    server = uvicorn.Server(config)
+    server_config = Config(
+        web_app, 
+        host=WEB_HOST, 
+        port=WEB_PORT, 
+        log_level="info", 
+        loop="asyncio"
+    )
+    server = uvicorn.Server(server_config)
     
-    log.info(f"🌐 Starting Uvicorn Web Server on {WEB_HOST}:{WEB_PORT}")
+    log.info(f"🌐 Starting Uvicorn Web Server on {WEB_HOST}:{WEB_PORT} (Render Health Check)")
     
-    # Server ko chalana
+    # Uvicorn server ko ek alag task ke roop mein chalana
     await server.serve()
+    
+    # Pyrogram client ko tab tak chalate rehna jab tak server chalta hai
+    await app.idle()
+
 
 if __name__ == "__main__":
     try:
-        # Asyncio event loop shuru karna
+        log.info("--- STARTING HYBRID BOT SERVICE ---")
         asyncio.run(run_bot_and_server())
     except KeyboardInterrupt:
         log.info("Bot Stopped by User.")
     except Exception as e:
-        log.error(f"A fatal error occurred: {e}")
-        
-# Note: Render par deploy karne ke liye, aapko 'uvicorn main:web_app --host 0.0.0.0 --port $PORT'
-# jaisa ek 'Start Command' set karna padega, ya uper diye gaye 'if __name__' block ka upyog karna padega.
+        log.error(f"A FATAL ERROR occurred in main execution: {e}")
