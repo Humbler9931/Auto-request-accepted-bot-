@@ -61,7 +61,7 @@ web_app = FastAPI()
 def home():
     return {"status": "✅ Bot is Running", "channel": CHANNEL_NAME}
 
-# ---------------- Handlers ---------------- #
+# ---------------- Handlers (Start Message) ---------------- #
 START_MESSAGE = (
     "👋 **Namaste {user_name}!** Main **{bot_name}** hoon.\n\n"
     "🤖 Mera kaam hai **{channel_name}** ke join requests ko turant approve karna!"
@@ -69,7 +69,7 @@ START_MESSAGE = (
 
 START_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("📚 Rules", url=RULES_LINK),
-     InlineKeyboardButton("📣 Join Channel", url=CHANNEL_LINK)],
+     InlineKeyboardButton("📣 Main Channel Join Karein", url=CHANNEL_LINK)],
     [InlineKeyboardButton("🛠️ Support", url=SUPPORT_LINK),
      InlineKeyboardButton("👤 Status", callback_data="status_check")]
 ])
@@ -93,13 +93,16 @@ async def start_handler(_, message):
 async def status_checker(_, callback_query):
     await callback_query.answer("🚀 Bot is Active & Auto-approving!", show_alert=True)
 
+# ---------------- 👑 AUTO APPROVAL HANDLER (CORRECTED FOR PM) 👑 ---------------- #
+
 WELCOME_TEXT = (
     "⚜️ **APPROVED!** {user_name}, swagat hai aapka **{channel_name}** mein 🚀\n\n"
-    "👉 Latest updates ke liye join karein: {mandatory_channel}"
+    "🎉 Aapka request **turant** accept ho gaya hai!\n"
+    "👉 Latest updates aur features ke liye **{mandatory_channel}** join karein."
 )
 
 WELCOME_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("✅ Join Channel", url=CHANNEL_LINK)],
+    [InlineKeyboardButton("✅ Narzox Channel Join Karein", url=CHANNEL_LINK)],
     [InlineKeyboardButton("📚 Rules", url=RULES_LINK),
      InlineKeyboardButton("🛠️ Support", url=SUPPORT_LINK)]
 ])
@@ -109,35 +112,53 @@ async def auto_approve(client: Client, req: ChatJoinRequest):
     user = req.from_user
     chat = req.chat
 
+    log.info(f"--- Processing Join Request from {user.first_name} for {chat.title} ---")
+
+    # 1. Request ko Approve karna
     try:
         await client.approve_chat_join_request(chat.id, user.id)
         log.info(f"✅ Approved: {user.first_name} for {chat.title}")
+    except Exception as e:
+        log.error(f"❌ Approval Failed: Check Bot Admin/Permission. Error: {e}")
+        return # Agar approve nahi hua to PM mat bhejo
 
+    # 2. Welcome Message PM (Private Message) mein bhejna
+    try:
         await client.send_message(
-            chat.id,
+            # Yahan chat.id ki jagah user.id use kiya gaya hai (PM ke liye)
+            user.id, 
             WELCOME_TEXT.format(
                 user_name=user.first_name,
-                channel_name=CHANNEL_NAME,
+                channel_name=chat.title, # Channel ka naam use kiya
                 mandatory_channel=MANDATORY_CHANNEL
             ),
             reply_markup=WELCOME_KEYBOARD
         )
+        log.info(f"✉️ Welcome PM sent to {user.first_name}")
+
     except FloodWait as e:
-        log.warning(f"⏳ FloodWait: Sleeping {e.value} sec")
+        # FloodWait ko yahan handle kiya jaa raha hai
+        log.warning(f"⏳ FloodWait on PM. Sleeping {e.value} sec.")
         time.sleep(e.value)
+        # Message dobara bhejne ki koshish nahi karte, aage badhte hain
     except Exception as e:
-        log.error(f"❌ Approval Failed: {e}")
+        # PM fail ho sakta hai agar user ne bot ko kabhi start na kiya ho
+        log.warning(f"⚠️ Failed to send PM to {user.first_name}. Error: {e}")
+
 
 # ---------------- Runner ---------------- #
 def run_fastapi():
     """Run FastAPI server (health check for Render)."""
+    # Uvicorn.run blocking hai, yeh thread chalta rahega
     uvicorn.run(web_app, host="0.0.0.0", port=WEB_PORT, log_level="info")
 
 if __name__ == "__main__":
     log.info("🚀 Starting Auto-Approve Bot (Hybrid Mode)...")
 
-    # Run FastAPI in separate thread
+    # FastAPI ko alag thread mein shuru karna (Web Service/Port ke liye)
+    # daemon=True se yeh thread main thread ke band hote hi band ho jayega
     threading.Thread(target=run_fastapi, daemon=True).start()
 
-    # Run Pyrogram Bot (main thread)
+    # Pyrogram Bot ko main thread mein shuru karna (Polling)
+    # App.run() blocking hai, isliye yeh main process chalta rahega
     app.run()
