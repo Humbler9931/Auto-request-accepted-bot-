@@ -30,6 +30,9 @@ try:
         log.error("❌ Missing Environment Variables: API_ID/API_HASH/BOT_TOKEN required!")
         sys.exit(1)
 
+    # Naya Variable yahan joda gaya hai
+    BOT_USERNAME = os.getenv("BOT_USERNAME", "@Aapka_Bot_ka_Username") 
+    
     CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0)) or None
     MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "@examplechannel")
     CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Advanced Community")
@@ -48,11 +51,13 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    sleep_threshold=60  # Auto handle FloodWait
+    sleep_threshold=60 
 )
 
 TARGET_FILTER = filters.chat(CHANNEL_ID) if CHANNEL_ID else filters.all
 CHANNEL_LINK = f"https://t.me/{MANDATORY_CHANNEL.strip('@')}"
+# Bot ko group mein add karne ka link
+ADD_TO_GROUP_LINK = f"https://t.me/{BOT_USERNAME.strip('@')}?startgroup=true"
 
 # ---------------- FastAPI (Render Health Check) ---------------- #
 web_app = FastAPI()
@@ -67,11 +72,19 @@ START_MESSAGE = (
     "🤖 Mera kaam hai **{channel_name}** ke join requests ko turant approve karna!"
 )
 
+# START KEYBOARD mein "Add To Group" button joda gaya
 START_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("📚 Rules", url=RULES_LINK),
-     InlineKeyboardButton("📣 Main Channel Join Karein", url=CHANNEL_LINK)],
-    [InlineKeyboardButton("🛠️ Support", url=SUPPORT_LINK),
-     InlineKeyboardButton("👤 Status", callback_data="status_check")]
+    [
+        InlineKeyboardButton("📣 Main Channel", url=CHANNEL_LINK),
+        InlineKeyboardButton("➕ Group Mein Jorein", url=ADD_TO_GROUP_LINK)
+    ],
+    [
+        InlineKeyboardButton("📚 Rules", url=RULES_LINK),
+        InlineKeyboardButton("🛠️ Support", url=SUPPORT_LINK)
+    ],
+    [
+        InlineKeyboardButton("👤 Status", callback_data="status_check")
+    ]
 ])
 
 @app.on_message(filters.command("start") & filters.private)
@@ -101,10 +114,16 @@ WELCOME_TEXT = (
     "👉 Latest updates aur features ke liye **{mandatory_channel}** join karein."
 )
 
+# WELCOME KEYBOARD mein "Add To Group" button joda gaya
 WELCOME_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("✅ Narzox Channel Join Karein", url=CHANNEL_LINK)],
-    [InlineKeyboardButton("📚 Rules", url=RULES_LINK),
-     InlineKeyboardButton("🛠️ Support", url=SUPPORT_LINK)]
+    [
+        InlineKeyboardButton("✅ Narzox Channel Join Karein", url=CHANNEL_LINK),
+        InlineKeyboardButton("➕ Bot Ko Group Mein Jorein", url=ADD_TO_GROUP_LINK)
+    ],
+    [
+        InlineKeyboardButton("📚 Rules", url=RULES_LINK),
+        InlineKeyboardButton("🛠️ Support", url=SUPPORT_LINK)
+    ]
 ])
 
 @app.on_chat_join_request(TARGET_FILTER)
@@ -120,16 +139,15 @@ async def auto_approve(client: Client, req: ChatJoinRequest):
         log.info(f"✅ Approved: {user.first_name} for {chat.title}")
     except Exception as e:
         log.error(f"❌ Approval Failed: Check Bot Admin/Permission. Error: {e}")
-        return # Agar approve nahi hua to PM mat bhejo
+        return
 
     # 2. Welcome Message PM (Private Message) mein bhejna
     try:
         await client.send_message(
-            # Yahan chat.id ki jagah user.id use kiya gaya hai (PM ke liye)
             user.id, 
             WELCOME_TEXT.format(
                 user_name=user.first_name,
-                channel_name=chat.title, # Channel ka naam use kiya
+                channel_name=chat.title,
                 mandatory_channel=MANDATORY_CHANNEL
             ),
             reply_markup=WELCOME_KEYBOARD
@@ -137,28 +155,22 @@ async def auto_approve(client: Client, req: ChatJoinRequest):
         log.info(f"✉️ Welcome PM sent to {user.first_name}")
 
     except FloodWait as e:
-        # FloodWait ko yahan handle kiya jaa raha hai
         log.warning(f"⏳ FloodWait on PM. Sleeping {e.value} sec.")
         time.sleep(e.value)
-        # Message dobara bhejne ki koshish nahi karte, aage badhte hain
     except Exception as e:
-        # PM fail ho sakta hai agar user ne bot ko kabhi start na kiya ho
         log.warning(f"⚠️ Failed to send PM to {user.first_name}. Error: {e}")
 
 
 # ---------------- Runner ---------------- #
 def run_fastapi():
     """Run FastAPI server (health check for Render)."""
-    # Uvicorn.run blocking hai, yeh thread chalta rahega
     uvicorn.run(web_app, host="0.0.0.0", port=WEB_PORT, log_level="info")
 
 if __name__ == "__main__":
     log.info("🚀 Starting Auto-Approve Bot (Hybrid Mode)...")
 
-    # FastAPI ko alag thread mein shuru karna (Web Service/Port ke liye)
-    # daemon=True se yeh thread main thread ke band hote hi band ho jayega
+    # FastAPI ko alag thread mein shuru karna
     threading.Thread(target=run_fastapi, daemon=True).start()
 
-    # Pyrogram Bot ko main thread mein shuru karna (Polling)
-    # App.run() blocking hai, isliye yeh main process chalta rahega
+    # Pyrogram Bot ko main thread mein shuru karna
     app.run()
