@@ -1,64 +1,66 @@
+#!/usr/bin/env python3
 import os
 import logging
 import asyncio
 import sys
 import time
-from typing import Dict, Any, Optional, Set
+import threading
+from typing import Dict, Optional, Set, Tuple
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardButton, Message, Chat
-from pyrogram.errors import FloodWait, UserNotParticipant, PeerIdInvalid, RPCError, UserIsBlocked, RPCError
-from pyrogram.enums import ChatType
+from pyrogram.errors import FloodWait, PeerIdInvalid, UserIsBlocked, UserNotParticipant, RPCError
 from fastapi import FastAPI
 import uvicorn
-import threading
 
 # ---------------- Logging Setup ---------------- #
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("UltraAutoApprover")
 
-# --- In-Memory Storage for Features --- #
-# Database Simulation: Stores user IDs for broadcasting
+# ---------------- In-Memory Storage ---------------- #
 USER_DATABASE: Set[int] = set()
-# Join Request Tracker: Key: (chat_id, user_id) -> Value: timestamp
-PENDING_REQUESTS: Dict[tuple, float] = {}
+PENDING_REQUESTS: Dict[Tuple[int, int], float] = {}  # (chat_id, user_id) -> timestamp
 
-# ---------------- Load Environment & Config ---------------- #
+# ---------------- Load environment ---------------- #
 load_dotenv()
 
 try:
-    API_ID = int(os.getenv("API_ID"))
+    API_ID = int(os.getenv("API_ID", "0")) or None
     API_HASH = os.getenv("API_HASH")
     BOT_TOKEN = os.getenv("BOT_TOKEN")
-    
-    # --- New Mandatory Configuration for Broadcast Feature ---
-    DEVELOPER_ID = int(os.getenv("DEVELOPER_ID")) 
-    
-    if not API_ID or not API_HASH or not BOT_TOKEN or not DEVELOPER_ID:
-        log.error("❌ Missing Environment Variables: API_ID/API_HASH/BOT_TOKEN/DEVELOPER_ID required!")
-        sys.exit(1)
 
-    # General Configuration
-    BOT_USERNAME = os.getenv("BOT_USERNAME", "YOUR_BOT_USERNAME") 
-    MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "@pyrogram_community")
-    CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Advanced Community")
+    # Optional / convenience
+    # Channel ID to auto-approve (if provided). Use env var name CHANNEL_ID for compatibility.
+    CHANNEL_ID_ENV = os.getenv("CHANNEL_ID")
+    AUTO_APPROVE_CHAT_ID: Optional[int] = int(CHANNEL_ID_ENV) if CHANNEL_ID_ENV and CHANNEL_ID_ENV.strip() else None
+
+    # Optional developer id for broadcast (if not provided, broadcast disabled)
+    DEVELOPER_ID_ENV = os.getenv("DEVELOPER_ID")
+    DEVELOPER_ID: Optional[int] = int(DEVELOPER_ID_ENV) if DEVELOPER_ID_ENV and DEVELOPER_ID_ENV.strip() else None
+
+    MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "@your_channel")
     RULES_LINK = os.getenv("RULES_LINK", "https://t.me/example_rules")
     SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/example_support")
-    
-    # Optional Specific Chat ID for Auto-Approval
-    AUTO_APPROVE_CHAT_ID: Optional[int] = int(os.getenv("AUTO_APPROVE_CHAT_ID", 0)) or None
 
     WEB_PORT = int(os.getenv("PORT", 8080))
 
+    if not API_ID or not API_HASH or not BOT_TOKEN:
+        log.error("❌ Missing required env vars: API_ID / API_HASH / BOT_TOKEN are required.")
+        sys.exit(1)
+
 except Exception as e:
-    log.error(f"❌ Environment Variable Error: {e}")
+    log.error(f"❌ Error while reading environment variables: {e}")
     sys.exit(1)
 
-# ---------------- Telegram Client ---------------- #
+CHANNEL_LINK = f"https://t.me/{MANDATORY_CHANNEL.strip('@')}"
+# BOT_USERNAME will be set after client starts (fallback for links)
+BOT_USERNAME: Optional[str] = None
+
+# ---------------- Pyrogram Client ---------------- #
 app = Client(
     "auto_approver_session",
     api_id=API_ID,
@@ -68,305 +70,269 @@ app = Client(
     in_memory=True
 )
 
-# Filters
-TARGET_FILTER = filters.chat(AUTO_APPROVE_CHAT_ID) if AUTO_APPROVE_CHAT_ID else filters.chat_join_request
-CHANNEL_LINK = f"https://t.me/{MANDATORY_CHANNEL.strip('@')}"
-ADD_TO_GROUP_LINK = f"https://t.me/{BOT_USERNAME.strip('@')}?startgroup=true"
-
-# ---------------- FastAPI (Render Health Check) ---------------- #
+# ---------------- FastAPI Health-check ---------------- #
 web_app = FastAPI()
+
 
 @web_app.get("/")
 def home():
-    """Health check endpoint."""
     return {
-        "status": "✅ Advanced Bot is Running", 
-        "target_chat_id": AUTO_APPROVE_CHAT_ID or "ALL",
-        "users_in_db": len(USER_DATABASE)
+        "status": "✅ Bot is running",
+        "auto_approve_chat_id": AUTO_APPROVE_CHAT_ID or "ALL",
+        "users_tracked": len(USER_DATABASE)
     }
 
-# ---------------- Helper Functions ---------------- #
 
+# ---------------- Helper Functions ---------------- #
 async def is_admin_or_creator(client: Client, chat_id: int, user_id: int) -> bool:
-    """Checks if a user is an admin or creator of the specified chat."""
     try:
         member = await client.get_chat_member(chat_id, user_id)
+        # member.status can be 'creator', 'administrator', 'member', 'restricted', etc.
         return member.status in ("administrator", "creator")
     except Exception as e:
-        log.error(f"Error checking admin status: {e}")
+        log.debug(f"Could not check admin status for {user_id} in {chat_id}: {e}")
         return False
 
-# ---------------- Handlers (Start Message & Status) ---------------- #
-START_MESSAGE = (
-    "👋 **Namaste {user_name}!** Main **{bot_name}** hoon.\n\n"
-    "🤖 Mera kaam hai **chat join requests** ko manage karna aur turant approve karna."
-    "Aur ab mere paas **Broadcasting** ki shakti bhi hai! ⚡️"
-)
 
-START_KEYBOARD = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("📣 Support Channel", url=CHANNEL_LINK),
-        InlineKeyboardButton("➕ Bot Ko Group Mein Jorein", url=ADD_TO_GROUP_LINK)
-    ],
-    [
-        InlineKeyboardButton("📚 Rules", url=RULES_LINK),
-        InlineKeyboardButton("🛠️ Support", url=SUPPORT_LINK)
-    ],
-    [
-        InlineKeyboardButton("👤 Status & User Count", callback_data="status_check")
-    ]
-])
-
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(_, message: Message):
-    """Handles the /start command in private chat and adds user to DB."""
-    
-    # 🌟 NEW: Add user to the in-memory database
-    user_id = message.from_user.id
-    if user_id not in USER_DATABASE:
-        USER_DATABASE.add(user_id)
-        log.info(f"🆕 User {user_id} added to database for broadcast.")
-        
-    try:
-        bot_info = await app.get_me()
-        await message.reply_text(
-            START_MESSAGE.format(
-                user_name=message.from_user.first_name,
-                bot_name=bot_info.first_name,
-            ),
-            reply_markup=START_KEYBOARD
-        )
-    except Exception as e:
-        log.error(f"Error in /start: {e}")
-
-@app.on_callback_query(filters.regex("status_check"))
-async def status_checker(_, callback_query):
-    """Handles the status check inline button."""
-    user_count = len(USER_DATABASE)
-    await callback_query.answer(
-        f"🚀 Bot Active | Total Users: {user_count} | Auto-approving (if configured)!", 
-        show_alert=True
-    )
-
-# ---------------- 👑 AUTO APPROVAL HANDLER 👑 ---------------- #
-WELCOME_TEXT = (
-    "⚜️ **APPROVED!** {user_name}, swagat hai aapka **{chat_title}** mein 🚀\n\n"
-    "🎉 Aapka request **turant** accept ho gaya hai!\n"
-    "👉 Latest updates aur features ke liye **{mandatory_channel}** join karein."
-)
-
-def get_welcome_keyboard(chat: Chat) -> InlineKeyboardMarkup:
-    """Generates the dynamic welcome keyboard."""
-    
-    if chat.username and f"@{chat.username}" == MANDATORY_CHANNEL:
-        channel_button = InlineKeyboardButton("✅ Channel Mein Jaayein", url=chat.invite_link or f"https://t.me/{chat.username}")
-    else:
-        channel_button = InlineKeyboardButton("📣 Main Channel", url=CHANNEL_LINK)
-
+def build_start_keyboard(bot_username: Optional[str]) -> InlineKeyboardMarkup:
+    add_group_link = f"https://t.me/{bot_username}?startgroup=true" if bot_username else "https://t.me/your_bot_here?startgroup=true"
     return InlineKeyboardMarkup([
         [
-            channel_button,
-            InlineKeyboardButton("➕ Bot Ko Group Mein Jorein", url=ADD_TO_GROUP_LINK)
+            InlineKeyboardButton("📣 Support Channel", url=CHANNEL_LINK),
+            InlineKeyboardButton("➕ADD ME ", url=add_group_link)
         ],
         [
             InlineKeyboardButton("📚 Rules", url=RULES_LINK),
             InlineKeyboardButton("🛠️ Support", url=SUPPORT_LINK)
+        ],
+        [
+            InlineKeyboardButton("👤 Status & User Count", callback_data="status_check")
         ]
     ])
 
-@app.on_chat_join_request(TARGET_FILTER)
+
+START_MESSAGE = (
+    "👋 **Namaste {user_name}!**\n\n"
+    "Main aapki madad karne wala bot hoon — chat join requests ko manage karta hoon aur "
+    "agar permission mile to turant approve kar deta hoon. 🎯\n\n"
+    "Use the buttons below to explore."
+)
+
+WELCOME_TEXT = (
+    "⚜️ **APPROVED!** {user_name}, swagat hai aapka **{chat_title}** mein 🚀\n\n"
+    "🎉 Aapka request **turant** accept ho gaya hai!\n"
+    "👉 Updates ke liye {mandatory_channel} join karein."
+)
+
+
+def get_welcome_keyboard(chat: Chat, bot_username: Optional[str]) -> InlineKeyboardMarkup:
+    # Prefer the configured mandatory channel link
+    channel_btn = InlineKeyboardButton("📣 Main Channel", url=CHANNEL_LINK)
+
+    add_group_link = f"https://t.me/{bot_username}?startgroup=true" if bot_username else f"https://t.me/your_bot_here?startgroup=true"
+
+    return InlineKeyboardMarkup([
+        [channel_btn, InlineKeyboardButton("➕ Bot Ko Group Mein Jorein", url=add_group_link)],
+        [InlineKeyboardButton("📚 Rules", url=RULES_LINK), InlineKeyboardButton("🛠️ Support", url=SUPPORT_LINK)]
+    ])
+
+
+# ---------------- Handlers ---------------- #
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(client: Client, message: Message):
+    user = message.from_user
+    if not user:
+        return
+
+    # add to DB
+    USER_DATABASE.add(user.id)
+    log.info(f"🆕 /start from {user.id} — added to USER_DATABASE (count={len(USER_DATABASE)})")
+
+    try:
+        me = await client.get_me()
+        bot_username_local = me.username or None
+        await message.reply_text(
+            START_MESSAGE.format(user_name=user.first_name or "User"),
+            reply_markup=build_start_keyboard(bot_username_local),
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        log.warning(f"Failed to respond to /start for {user.id}: {e}")
+
+
+@app.on_callback_query(filters.regex(r"^status_check$"))
+async def status_checker(client: Client, callback_query):
+    await callback_query.answer(
+        f"🚀 Bot Active | Total Users Tracked: {len(USER_DATABASE)}",
+        show_alert=True
+    )
+
+
+# ---------------- Auto-approve join requests ---------------- #
+@app.on_chat_join_request()
 async def auto_approve(client: Client, req: ChatJoinRequest):
-    """Automatically approves join requests and sends welcome PM."""
     user = req.from_user
     chat = req.chat
 
-    log.info(f"--- Processing Join Request from {user.first_name} ({user.id}) for {chat.title} ({chat.id}) ---")
-    
+    # If AUTO_APPROVE_CHAT_ID is set, only process that chat
+    if AUTO_APPROVE_CHAT_ID and chat.id != AUTO_APPROVE_CHAT_ID:
+        log.debug(f"Ignoring join request from chat {chat.id} because AUTO_APPROVE_CHAT_ID is set.")
+        return
+
+    log.info(f"➡️ Processing join request: user={user.id} ({user.first_name}) chat={chat.id} ({chat.title})")
     request_key = (chat.id, user.id)
     PENDING_REQUESTS[request_key] = time.time()
-    
-    # 🌟 NEW: Add user to the in-memory database upon successful approval
-    if user.id not in USER_DATABASE:
-        USER_DATABASE.add(user.id)
-        log.info(f"🆕 User {user.id} added to database from join request.")
 
-    # 1. Request ko Approve karna
+    # Add to in-memory DB
+    USER_DATABASE.add(user.id)
+
+    # Approve request
     try:
         await client.approve_chat_join_request(chat.id, user.id)
-        log.info(f"✅ Approved: {user.first_name} for {chat.title}")
         PENDING_REQUESTS.pop(request_key, None)
-        
+        log.info(f"✅ Approved join request: {user.id} -> {chat.title} ({chat.id})")
     except RPCError as e:
-        log.error(f"❌ Approval Failed (RPC Error - Check Bot Admin/Permission for {chat.title}): {e}")
+        log.error(f"❌ RPCError while approving {user.id} for chat {chat.id}: {e}")
         return
     except Exception as e:
-        log.error(f"❌ Approval Failed (General Error): {e}")
+        log.error(f"❌ Unexpected error while approving join request: {e}")
         return
 
-    # 2. Welcome Message PM (Private Message) mein bhejna
+    # Try sending private welcome message
     try:
+        me = await client.get_me()
+        bot_username_local = me.username or BOT_USERNAME or None
         await client.send_message(
-            user.id, 
-            WELCOME_TEXT.format(
-                user_name=user.first_name,
-                chat_title=chat.title,
-                mandatory_channel=MANDATORY_CHANNEL
-            ),
-            reply_markup=get_welcome_keyboard(chat)
+            user.id,
+            WELCOME_TEXT.format(user_name=user.first_name or "Friend", chat_title=chat.title or "this chat", mandatory_channel=MANDATORY_CHANNEL),
+            reply_markup=get_welcome_keyboard(chat, bot_username_local)
         )
-        log.info(f"✉️ Welcome PM sent to {user.first_name}")
-
-    except FloodWait as e:
-        log.warning(f"⏳ FloodWait on PM. Sleeping {e.value} sec.")
-        await asyncio.sleep(e.value)
-        # Attempt to send again after sleep
-        try:
-             await client.send_message(
-                user.id, 
-                WELCOME_TEXT.format(
-                    user_name=user.first_name,
-                    chat_title=chat.title,
-                    mandatory_channel=MANDATORY_CHANNEL
-                ),
-                reply_markup=get_welcome_keyboard(chat)
-            )
-        except Exception as retry_e:
-            log.warning(f"⚠️ Retry Failed to send PM to {user.first_name}. Error: {retry_e}")
-            
-    except PeerIdInvalid:
-        log.warning(f"⚠️ Failed to send PM to {user.first_name}. User blocked bot.")
-    except Exception as e:
-        log.warning(f"⚠️ Failed to send PM to {user.first_name}. Error: {e}")
-
-
-# ---------------- Advanced Admin Commands (Manual Approval) ---------------- #
-
-@app.on_message(filters.command("approve") & filters.group)
-async def manual_approve_handler(client: Client, message: Message):
-    """Handles manual approval command by group admins."""
-    
-    # 1. Admin Check
-    if not await is_admin_or_creator(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ **Kshama**! Yeh command sirf **Admins** ke liye hai.")
-        return
-
-    # [Remaining approval logic is the same as the previous version...]
-    # 2. Target User Identification
-    target_user_id = None
-    if message.reply_to_message:
-        target_user_id = message.reply_to_message.from_user.id
-    elif len(message.command) > 1 and message.command[1].isdigit():
-        target_user_id = int(message.command[1])
-    else:
-        await message.reply_text("❓ **Kripya** uss user ko reply karein ya uska user ID `/approve <user_id>` format mein dein jise aap approve karna chahte hain.")
-        return
-
-    # 3. Manual Approval & PM Logic (Re-used for brevity)
-    request_key = (message.chat.id, target_user_id)
-    try:
-        await client.approve_chat_join_request(message.chat.id, target_user_id)
-        PENDING_REQUESTS.pop(request_key, None)
-        
-        approved_user = await client.get_users(target_user_id)
-        
-        confirmation_text = f"✅ **Manually Approved!** **{approved_user.first_name}** ({approved_user.id}) ko **{message.chat.title}** mein jodne ki anumati de di gayi hai."
-        await message.reply_text(confirmation_text)
-        
-        # Add to DB on manual approval too
-        if target_user_id not in USER_DATABASE:
-            USER_DATABASE.add(target_user_id)
-            
-        # Optional: Send PM (re-using the logic from auto_approve)
+        log.info(f"✉️ Sent welcome PM to {user.id}")
+    except FloodWait as fw:
+        log.warning(f"⏳ FloodWait when sending PM to {user.id}: sleeping {fw.value}s")
+        await asyncio.sleep(fw.value)
         try:
             await client.send_message(
-                target_user_id, 
-                WELCOME_TEXT.format(
-                    user_name=approved_user.first_name,
-                    chat_title=message.chat.title,
-                    mandatory_channel=MANDATORY_CHANNEL
-                ),
-                reply_markup=get_welcome_keyboard(message.chat)
+                user.id,
+                WELCOME_TEXT.format(user_name=user.first_name or "Friend", chat_title=chat.title or "this chat", mandatory_channel=MANDATORY_CHANNEL),
+                reply_markup=get_welcome_keyboard(chat, BOT_USERNAME)
             )
-        except Exception as pm_e:
-            log.warning(f"⚠️ Failed to send PM after manual approval to {approved_user.first_name}. Error: {pm_e}")
-            
-    except RPCError as e:
-        await message.reply_text(f"❌ **Approval Failed!** ({e.__class__.__name__}): Bot ke paas Admin Permissions nahi hain ya request expire ho chuka hai.")
+            log.info(f"✉️ Sent welcome PM to {user.id} after waiting")
+        except Exception as e2:
+            log.warning(f"⚠️ Retry failed sending PM to {user.id}: {e2}")
+    except (PeerIdInvalid, UserIsBlocked, UserNotParticipant):
+        # Can't PM user (blocked or hasn't started bot)
+        log.info(f"⚠️ Could not PM user {user.id} — sending a fallback message to the chat.")
+        try:
+            mention = user.mention if hasattr(user, "mention") else f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
+            await client.send_message(chat.id, f"Welcome {mention}! ✅", parse_mode="html")
+        except Exception as e:
+            log.debug(f"Failed to send fallback chat message in {chat.id}: {e}")
     except Exception as e:
-        await message.reply_text(f"❌ **Approval Failed!** (General Error): {e}")
+        log.warning(f"⚠️ Failed to send PM to {user.id}: {e}")
 
-# ---------------- ⚡️ BROADCAST HANDLER ⚡️ ---------------- #
 
+# ---------------- Manual approve command (admins only) ---------------- #
+@app.on_message(filters.command("approve") & filters.group)
+async def manual_approve_handler(client: Client, message: Message):
+    # Admin check
+    if not await is_admin_or_creator(client, message.chat.id, message.from_user.id):
+        await message.reply_text("⛔ Yeh command sirf admins ke liye hai.")
+        return
+
+    target_user_id = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_user_id = message.reply_to_message.from_user.id
+    elif len(message.command) > 1 and message.command[1].lstrip("-").isdigit():
+        target_user_id = int(message.command[1])
+    else:
+        await message.reply_text("❓ Reply karein user ko ya `/approve <user_id>` dein.")
+        return
+
+    try:
+        await client.approve_chat_join_request(message.chat.id, target_user_id)
+        PENDING_REQUESTS.pop((message.chat.id, target_user_id), None)
+        approved_user = await client.get_users(target_user_id)
+        await message.reply_text(f"✅ {approved_user.first_name} ({approved_user.id}) ko approve kar diya gaya.")
+        USER_DATABASE.add(target_user_id)
+
+        # Try to PM
+        try:
+            me = await client.get_me()
+            bot_username_local = me.username or BOT_USERNAME or None
+            await client.send_message(
+                target_user_id,
+                WELCOME_TEXT.format(user_name=approved_user.first_name or "Friend", chat_title=message.chat.title, mandatory_channel=MANDATORY_CHANNEL),
+                reply_markup=get_welcome_keyboard(message.chat, bot_username_local)
+            )
+        except Exception as e:
+            log.debug(f"Could not send PM after manual approval to {target_user_id}: {e}")
+
+    except RPCError as e:
+        await message.reply_text(f"❌ Approval failed (RPCError): {e}")
+    except Exception as e:
+        await message.reply_text(f"❌ Approval failed: {e}")
+
+
+# ---------------- Broadcast (developer only) ---------------- #
 @app.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_handler(client: Client, message: Message):
-    """Sends a message to all users in the USER_DATABASE."""
-    
-    # 1. Developer/Owner Check
+    if not DEVELOPER_ID:
+        await message.reply_text("⚠️ Broadcasting is disabled on this bot (DEVELOPER_ID not configured).")
+        return
+
     if message.from_user.id != DEVELOPER_ID:
-        await message.reply_text("⛔ **Anumati nahi**! Yeh command sirf bot ke **Developer** ke liye hai.")
+        await message.reply_text("⛔ Yeh command sirf developer ke liye hai.")
         return
 
-    # 2. Get the content to broadcast
     if not message.reply_to_message:
-        await message.reply_text("❓ **Kripya** uss message ko reply karein jise aap **broadcast** karna chahte hain.")
+        await message.reply_text("❓ Reply karein us message ko jise aap broadcast karna chahte hain.")
         return
 
-    # 3. Preparation & Execution
-    log.info(f"✨ Starting broadcast to {len(USER_DATABASE)} users...")
-    
-    sent_count = 0
-    blocked_count = 0
-    
     broadcast_message = message.reply_to_message
-    
-    await message.reply_text(f"🚀 **Broadcast Shuru**! Message ko **{len(USER_DATABASE)}** users tak bheja ja raha hai...")
+    total = len(USER_DATABASE)
+    await message.reply_text(f"🚀 Broadcast shuru ho raha hai — {total} users ko bheja jayega.")
 
-    for user_id in list(USER_DATABASE): # Use list() to avoid issues if set changes during iteration
+    sent = 0
+    failed = 0
+    for uid in list(USER_DATABASE):
         try:
-            await broadcast_message.copy(user_id)
-            sent_count += 1
-            await asyncio.sleep(0.05) # Small delay to respect rate limits
-            
-        except FloodWait as e:
-            log.warning(f"⏳ FloodWait during broadcast. Sleeping {e.value} sec.")
-            await asyncio.sleep(e.value)
-            # Retry after sleep
+            await broadcast_message.copy(uid)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except FloodWait as fw:
+            log.warning(f"⏳ FloodWait during broadcast: sleeping {fw.value}s")
+            await asyncio.sleep(fw.value)
             try:
-                await broadcast_message.copy(user_id)
-                sent_count += 1
+                await broadcast_message.copy(uid)
+                sent += 1
             except Exception:
-                pass # Ignore if retry also fails
-                
-        except (UserIsBlocked, UserNotParticipant, PeerIdInvalid, RPCError):
-            # User blocked the bot or is no longer reachable
-            USER_DATABASE.discard(user_id) 
-            blocked_count += 1
-            
+                failed += 1
+        except (UserIsBlocked, UserNotParticipant, PeerIdInvalid, RPCError) as e:
+            USER_DATABASE.discard(uid)
+            failed += 1
         except Exception as e:
-            log.error(f"❌ Error sending broadcast to {user_id}: {e}")
-        
-    # 4. Final Report
-    final_report = (
-        "✅ **Broadcast Samapt!**\n"
-        f"➡️ **Sent Successfully**: {sent_count} messages\n"
-        f"🚫 **Blocked/Failed**: {blocked_count} users\n"
-        f"👥 **Current User Count**: {len(USER_DATABASE)}"
-    )
-    
-    await message.reply_text(final_report)
-    log.info(f"✨ Broadcast Finished. Report: Sent={sent_count}, Blocked={blocked_count}")
+            log.error(f"Error broadcasting to {uid}: {e}")
+            failed += 1
+
+    await message.reply_text(f"✅ Broadcast complete. Sent: {sent}, Failed/Removed: {failed}, Current tracked: {len(USER_DATABASE)}")
 
 
-# ---------------- Runner ---------------- #
+# ---------------- Run ---------------- #
 def run_fastapi():
-    """Run FastAPI server (health check)."""
-    uvicorn.run(web_app, host="0.0.0.0", port=WEB_PORT, log_level="error")
+    uvicorn.run(web_app, host="0.0.0.0", port=WEB_PORT, log_level="info")
+
 
 if __name__ == "__main__":
-    log.info("🚀 Starting Ultra Advanced Bot (Hybrid Mode with Broadcast)...")
+    log.info("🚀 Starting Bot — FastAPI healthcheck + Pyrogram bot")
 
-    # FastAPI ko alag thread mein shuru karna (For health check)
+    # Start health check server in background thread
     threading.Thread(target=run_fastapi, daemon=True).start()
 
-    # Pyrogram Bot ko main thread mein shuru karna
-    app.run()
+    # Run pyrogram (blocks)
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        log.info("⌛ Shutting down (KeyboardInterrupt)")
+    except Exception as e:
+        log.error(f"🔥 Fatal error running pyrogram client: {e}")
