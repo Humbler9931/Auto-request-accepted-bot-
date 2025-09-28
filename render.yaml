@@ -1,1 +1,18 @@
-
+services:
+  - type: web
+    name: telegram-auto-approve-bot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    plan: free
+    envVars:
+      - key: API_ID
+        value: YOUR_API_ID_HERE
+      - key: API_HASH
+        value: YOUR_API_HASH_HERE
+      - key: BOT_TOKEN
+        value: YOUR_BOT_TOKEN_HERE
+      - key: CHANNEL_ID
+        value: "-1001234567890"
+      - key: MANDATORY_CHANNEL
+        value: "@narzoxbot"
