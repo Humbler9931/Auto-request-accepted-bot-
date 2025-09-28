@@ -95,7 +95,7 @@ async def is_admin_or_creator(client: Client, chat_id: int, user_id: int) -> boo
 
 
 def build_start_keyboard(bot_username: Optional[str]) -> InlineKeyboardMarkup:
-    add_group_link = f"https://t.me/{bot_username}?startgroup=true" if bot_username else "https://t.me/your_bot_here?startgroup=true"
+    add_group_link = f"https://t.me/{bot_username}?startgroup=true" if bot_username else "https://t.me/your_bot_here?startchannel=true"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📣 Support Channel", url=CHANNEL_LINK),
