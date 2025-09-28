@@ -1,4 +1,7 @@
 pyrogram
 tqdm
 tgcrypto
-python-dotenv  # .env file se variables load karne ke liye
+python-dotenv
+# Web Server Dependencies
+fastapi
+uvicorn
