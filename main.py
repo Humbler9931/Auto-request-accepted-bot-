@@ -34,7 +34,7 @@ try:
     BOT_TOKEN = os.getenv("BOT_TOKEN")
 
     # Optional / convenience
-    # Channel ID to auto-approve (if provided). Use env var name CHANNEL_ID for compatibility.
+    # Channel ID to auto-approve (if provided). Agar ye set nahi kiya gaya to sabhi chats ke requests accept honge.
     CHANNEL_ID_ENV = os.getenv("CHANNEL_ID")
     AUTO_APPROVE_CHAT_ID: Optional[int] = int(CHANNEL_ID_ENV) if CHANNEL_ID_ENV and CHANNEL_ID_ENV.strip() else None
 
@@ -78,16 +78,16 @@ web_app = FastAPI()
 def home():
     return {
         "status": "✅ Bot is running",
-        "auto_approve_chat_id": AUTO_APPROVE_CHAT_ID or "ALL",
+        "auto_approve_chat_id": AUTO_APPROVE_CHAT_ID or "ALL (All chats are supported)",
         "users_tracked": len(USER_DATABASE)
     }
 
 
 # ---------------- Helper Functions ---------------- #
 async def is_admin_or_creator(client: Client, chat_id: int, user_id: int) -> bool:
+    """Checks if a user is an admin or creator in a chat."""
     try:
         member = await client.get_chat_member(chat_id, user_id)
-        # member.status can be 'creator', 'administrator', 'member', 'restricted', etc.
         return member.status in ("administrator", "creator")
     except Exception as e:
         log.debug(f"Could not check admin status for {user_id} in {chat_id}: {e}")
@@ -95,6 +95,7 @@ async def is_admin_or_creator(client: Client, chat_id: int, user_id: int) -> boo
 
 
 def build_start_keyboard(bot_username: Optional[str]) -> InlineKeyboardMarkup:
+    """Builds the keyboard for the /start message."""
     add_group_link = f"https://t.me/{bot_username}?startgroup=true" if bot_username else "https://t.me/your_bot_here?startchannel=true"
     return InlineKeyboardMarkup([
         [
@@ -126,6 +127,7 @@ WELCOME_TEXT = (
 
 
 def get_welcome_keyboard(chat: Chat, bot_username: Optional[str]) -> InlineKeyboardMarkup:
+    """Builds the keyboard for the private welcome message."""
     # Prefer the configured mandatory channel link
     channel_btn = InlineKeyboardButton("📣 Main Channel", url=CHANNEL_LINK)
 
@@ -167,16 +169,18 @@ async def status_checker(client: Client, callback_query):
         show_alert=True
     )
 
-
-# ---------------- Auto-approve join requests ---------------- #
+# ----------------------------------------------
+## Auto-Approve Join Requests (Universal)
+# ----------------------------------------------
 @app.on_chat_join_request()
 async def auto_approve(client: Client, req: ChatJoinRequest):
     user = req.from_user
     chat = req.chat
 
-    # If AUTO_APPROVE_CHAT_ID is set, only process that chat
+    # IMPORTANT: Agar AUTO_APPROVE_CHAT_ID set nahi hai, to ye check skip ho jayega aur bot
+    # sabhi chats ke requests ko process karega jahan use admin permission mili hai.
     if AUTO_APPROVE_CHAT_ID and chat.id != AUTO_APPROVE_CHAT_ID:
-        log.debug(f"Ignoring join request from chat {chat.id} because AUTO_APPROVE_CHAT_ID is set.")
+        log.debug(f"Ignoring join request from chat {chat.id} because AUTO_APPROVE_CHAT_ID is set and doesn't match.")
         return
 
     log.info(f"➡️ Processing join request: user={user.id} ({user.first_name}) chat={chat.id} ({chat.title})")
@@ -186,13 +190,13 @@ async def auto_approve(client: Client, req: ChatJoinRequest):
     # Add to in-memory DB
     USER_DATABASE.add(user.id)
 
-    # Approve request
+    # Approve request (Using the robust ChatJoinRequest.approve() method)
     try:
-        await client.approve_chat_join_request(chat.id, user.id)
+        await req.approve()  # <--- Yahi change hai, jo advanced aur universal hai.
         PENDING_REQUESTS.pop(request_key, None)
         log.info(f"✅ Approved join request: {user.id} -> {chat.title} ({chat.id})")
     except RPCError as e:
-        log.error(f"❌ RPCError while approving {user.id} for chat {chat.id}: {e}")
+        log.error(f"❌ RPCError while approving {user.id} for chat {chat.id}: {e} (Bot ko 'Manage Chat Invite Links' permission chahiye)")
         return
     except Exception as e:
         log.error(f"❌ Unexpected error while approving join request: {e}")
