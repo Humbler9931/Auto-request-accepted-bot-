@@ -69,6 +69,65 @@ app = Client(
 
 app._cleaner_task_started = False
 
+
+
+
+# ... (Baaki saara code waisa hi rahega)
+
+# ---------------- Scheduled Background Cleaner Task ---------------- #
+# ... (This function remains unchanged)
+
+# ---------------- Handlers (Filters.me removed, replaced by direct call below) ---------------- #
+# (startup_cleaner_scheduler ko yahan se hata diya gaya hai)
+# ... (Baaki sabhi handlers waisa hi rahenge)
+
+# ---------------- Run ---------------- #
+def run_fastapi():
+    """FastAPI health check server ko separate thread mein chalaata hai."""
+    uvicorn.run(web_app, host="0.0.0.0", port=WEB_PORT, log_level="info")
+
+# Nayi Function: Bot ko start kare aur background task turant shuru kare
+async def start_bot_and_tasks():
+    global BOT_USERNAME
+    
+    # 1. Client Start karein
+    await app.start()
+    log.info("Client successfully connected to Telegram. Setting up background tasks...")
+    
+    # 2. BOT_USERNAME set karein
+    if not BOT_USERNAME:
+        me = await app.get_me()
+        BOT_USERNAME = me.username
+        log.info(f"Bot Username set to: @{BOT_USERNAME}")
+
+    # 3. Cleaner Task Guarantee ke saath start karein
+    if not app._cleaner_task_started:
+        log.info("Starting initial checks and GUARANTEED background pending requests cleaner task...")
+        # Task ko shuru karein aur ruken nahi (non-blocking)
+        asyncio.create_task(pending_requests_cleaner(app))
+        app._cleaner_task_started = True
+        log.info("Background pending cleaner task started successfully and will run every 5 minutes.")
+
+    # Bot ko chalu rakhein
+    await app.idle()
+
+
+if __name__ == "__main__":
+    log.info("🚀 Starting Bot — FastAPI healthcheck + Pyrogram bot")
+
+    # Start health check server in background thread
+    threading.Thread(target=run_fastapi, daemon=True).start()
+
+    # Run pyrogram (using asyncio to manage the main async function)
+    try:
+        # Pura process ab start_bot_and_tasks ke through control hoga.
+        asyncio.run(start_bot_and_tasks())
+    except KeyboardInterrupt:
+        log.info("⌛ Shutting down (KeyboardInterrupt)")
+    except Exception as e:
+        log.error(f"🔥 Fatal error running pyrogram client: {e}")
+
+
 # ---------------- FastAPI Health-check ---------------- #
 web_app = FastAPI()
 
