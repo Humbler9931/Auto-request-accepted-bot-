@@ -40,9 +40,9 @@ try:
     DEVELOPER_ID_ENV = os.getenv("DEVELOPER_ID")
     DEVELOPER_ID: Optional[int] = int(DEVELOPER_ID_ENV) if DEVELOPER_ID_ENV and DEVELOPER_ID_ENV.strip() else None
 
-    MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "@your_channel")
-    RULES_LINK = os.getenv("RULES_LINK", "https://t.me/example_rules")
-    SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/example_support")
+    MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "@narzoxbot")
+    RULES_LINK = os.getenv("RULES_LINK", "https://t.me/teamrajweb")
+    SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/narzoxbot")
 
     WEB_PORT = int(os.getenv("PORT", 8080))
 
