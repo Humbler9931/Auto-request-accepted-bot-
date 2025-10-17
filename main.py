@@ -9,7 +9,7 @@ from typing import Dict, Optional, Set, Tuple
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
-from pyrogram.types import ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardButton, Message, Chat, ChatMemberUpdated
+from pyrogram.types import ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardButton, Message, Chat
 from pyrogram.errors import FloodWait, PeerIdInvalid, UserIsBlocked, UserNotParticipant, RPCError
 from fastapi import FastAPI
 import uvicorn
@@ -24,7 +24,6 @@ log = logging.getLogger("UltraAutoApprover")
 # ---------------- In-Memory Storage ---------------- #
 USER_DATABASE: Set[int] = set()
 PENDING_REQUESTS: Dict[Tuple[int, int], float] = {}  # (chat_id, user_id) -> timestamp
-PROCESSED_CHATS: Set[int] = set()  # Track which chats have been initially processed
 
 # ---------------- Load environment ---------------- #
 load_dotenv()
@@ -77,14 +76,13 @@ web_app = FastAPI()
 @web_app.get("/")
 def home():
     """Health check for external pinger services (like UptimeRobot)."""
+    # Note: Accessing app._cleaner_task_started here is safe because it's set before the main app.run() loop starts its worker threads.
     return {
         "status": "✅ Bot is Running (via FastAPI)",
         "auto_approve_chat_id": AUTO_APPROVE_CHAT_ID or "ALL (Using Safe Dialog Check)",
         "users_tracked": len(USER_DATABASE),
-        "cleaner_task_active": app._cleaner_task_started,
-        "processed_chats": len(PROCESSED_CHATS)
+        "cleaner_task_active": app._cleaner_task_started
     }
-
 
 # ---------------- Helper Functions ---------------- #
 async def is_admin_or_creator(client: Client, chat_id: int, user_id: int) -> bool:
@@ -140,138 +138,18 @@ def get_welcome_keyboard(chat: Chat, bot_username: Optional[str]) -> InlineKeybo
     ])
 
 
-# ---------------- Core: Send Welcome DM ---------------- #
-async def send_welcome_dm(client: Client, user_id: int, user_name: str, chat_title: str):
-    """Send personalized welcome DM to approved user."""
-    global BOT_USERNAME
-    
-    try:
-        if not BOT_USERNAME:
-            me = await client.get_me()
-            BOT_USERNAME = me.username
-        
-        chat_obj = type('obj', (object,), {'title': chat_title})()
-        
-        await client.send_message(
-            user_id,
-            WELCOME_TEXT.format(
-                user_name=user_name,
-                chat_title=chat_title,
-                mandatory_channel=MANDATORY_CHANNEL
-            ),
-            reply_markup=get_welcome_keyboard(chat_obj, BOT_USERNAME)
-        )
-        log.info(f"✉️ Welcome DM sent to {user_id} ({user_name})")
-        return True
-        
-    except (PeerIdInvalid, UserIsBlocked, UserNotParticipant) as e:
-        log.debug(f"⚠️ Cannot send DM to {user_id}: {type(e).__name__}")
-        return False
-    except Exception as e:
-        log.warning(f"⚠️ Failed to send DM to {user_id}: {e}")
-        return False
-
-
-# ---------------- Core: Approve Single Request ---------------- #
-async def approve_request_with_dm(client: Client, chat_id: int, user_id: int, user_name: str, chat_title: str):
-    """Approve a single request and send DM."""
-    try:
-        await client.approve_chat_join_request(chat_id, user_id)
-        USER_DATABASE.add(user_id)
-        log.info(f"✅ Approved: {user_name} ({user_id}) -> {chat_title} ({chat_id})")
-        
-        # Send welcome DM
-        await send_welcome_dm(client, user_id, user_name, chat_title)
-        
-        return True
-        
-    except FloodWait as fw:
-        log.warning(f"⏳ FloodWait: sleeping {fw.value}s")
-        await asyncio.sleep(fw.value)
-        return await approve_request_with_dm(client, chat_id, user_id, user_name, chat_title)
-        
-    except RPCError as e:
-        log.error(f"❌ RPCError approving {user_id} in {chat_id}: {e}")
-        return False
-        
-    except Exception as e:
-        log.error(f"❌ Error approving {user_id}: {e}")
-        return False
-
-
-# ---------------- Core: Clear All Pending Requests for a Chat ---------------- #
-async def clear_pending_requests(client: Client, chat_id: int, chat_title: str = None):
-    """Clear all pending requests for a specific chat."""
-    if chat_id in PROCESSED_CHATS:
-        log.debug(f"Chat {chat_id} already processed, skipping.")
-        return 0
-    
-    approved_count = 0
-    
-    try:
-        # Get chat details if title not provided
-        if not chat_title:
-            try:
-                chat = await client.get_chat(chat_id)
-                chat_title = chat.title or f"Chat {chat_id}"
-            except:
-                chat_title = f"Chat {chat_id}"
-        
-        log.info(f"🧹 Starting to clear pending requests for: {chat_title} ({chat_id})")
-        
-        # Get all pending requests (limit 200 per cycle to avoid timeout)
-        async for req in client.get_chat_join_requests(chat_id, limit=200):
-            user = req.from_user
-            user_name = user.first_name or "User"
-            
-            success = await approve_request_with_dm(
-                client, 
-                chat_id, 
-                user.id, 
-                user_name, 
-                chat_title
-            )
-            
-            if success:
-                approved_count += 1
-            
-            # Small delay to avoid flooding
-            await asyncio.sleep(0.1)
-        
-        if approved_count > 0:
-            log.info(f"🎉 Cleared {approved_count} pending requests from {chat_title}")
-        else:
-            log.info(f"✓ No pending requests in {chat_title}")
-        
-        PROCESSED_CHATS.add(chat_id)
-        return approved_count
-        
-    except FloodWait as fw:
-        log.warning(f"⏳ FloodWait during clearing {chat_id}: sleeping {fw.value}s")
-        await asyncio.sleep(fw.value)
-        return await clear_pending_requests(client, chat_id, chat_title)
-        
-    except RPCError as e:
-        log.error(f"❌ RPCError clearing {chat_id}: {e} (Check bot permissions)")
-        return approved_count
-        
-    except Exception as e:
-        log.error(f"❌ Error clearing pending requests for {chat_id}: {e}")
-        return approved_count
-
-
 # ---------------- Scheduled Background Cleaner Task ---------------- #
 async def pending_requests_cleaner(client: Client):
     """
-    Background task to check and clear pending requests periodically (every 5 mins).
+    Background task to check and clear already pending requests periodically (every 5 mins).
+    This handles requests that arrived while the bot was offline or asleep (due to Render).
     """
     global BOT_USERNAME
     
-    # Initial delay before first run
-    await asyncio.sleep(10)
-    
     while True:
-        log.info("🧹 Starting scheduled check for pending requests...")
+        # Wait 5 minutes. This delay is non-blocking.
+        await asyncio.sleep(300)
+        log.info("🧹 Starting scheduled check for already pending requests...")
         
         chats_to_check: Set[int] = set()
         
@@ -280,81 +158,94 @@ async def pending_requests_cleaner(client: Client):
             chats_to_check.add(AUTO_APPROVE_CHAT_ID)
             log.debug(f"Checking only the configured chat: {AUTO_APPROVE_CHAT_ID}")
         else:
-            # Check recent 100 chats (optimized)
+            # Check a limited number of recent chats (safer for high chat count)
             try:
-                async for dialog in client.get_dialogs(limit=100):
+                # Fetch recent 500 dialogs to find potential target chats
+                async for dialog in client.get_dialogs(limit=500):
                     if dialog.chat.type in ["channel", "supergroup"]:
                         chats_to_check.add(dialog.chat.id)
-                log.info(f"Found {len(chats_to_check)} chats/channels to check.")
+                log.info(f"Found {len(chats_to_check)} active chats/channels to check.")
             except Exception as e:
                 log.error(f"Error getting dialogs for cleaner: {e}")
 
-        # Process pending requests for each chat
+        # Process pending requests for each identified chat
         total_approved = 0
         for chat_id in chats_to_check:
-            # Skip already processed chats in this cycle
-            if chat_id in PROCESSED_CHATS:
-                continue
+            approved_count = 0
+            
+            try:
+                # Get and approve up to 50 pending requests per cycle per chat
+                async for req in client.get_chat_join_requests(chat_id, limit=50):
+                    await client.approve_chat_join_request(chat_id, req.user.id)
+                    USER_DATABASE.add(req.user.id)
+                    approved_count += 1
                 
-            approved = await clear_pending_requests(client, chat_id)
-            total_approved += approved
+                if approved_count > 0:
+                    log.info(f"✅ Auto-cleaned {approved_count} pending requests in chat {chat_id}")
+                    total_approved += approved_count
+                    
+            except FloodWait as fw:
+                log.warning(f"⏳ FloodWait during cleaner for {chat_id}: sleeping {fw.value}s")
+                await asyncio.sleep(fw.value)
+            except RPCError as e:
+                # Bot might have lost 'Manage Invite Links' permission in this chat
+                log.debug(f"⚠️ RPCError while auto-cleaning {chat_id}: {e}")
+            except Exception as e:
+                log.error(f"❌ Unexpected error in auto-cleaner for {chat_id}: {e}")
 
         if total_approved > 0:
             log.info(f"🎉 Scheduled check finished. Total approved: {total_approved}")
         else:
             log.info("🧹 Scheduled check finished. No pending requests found.")
-        
-        # Clear processed chats set for next cycle
-        PROCESSED_CHATS.clear()
-        
-        # Wait 5 minutes before next cycle
-        await asyncio.sleep(300)
 
-
-# ---------------- NEW: Bot Added to Channel Handler ---------------- #
-@app.on_chat_member_updated()
-async def bot_added_to_chat(client: Client, update: ChatMemberUpdated):
+# ---------------- Startup Hook ---------------- #
+@app.on_message(filters.me)
+async def startup_cleaner_scheduler(client: Client, message: Message):
     """
-    When bot is added to a new chat/channel, immediately clear all pending requests.
+    Ensures global BOT_USERNAME is set and the background cleaner task starts only once.
+    This fires when the bot receives its own messages (filters.me) or sends its first message.
     """
-    # Check if this update is about our bot
-    me = await client.get_me()
+    global BOT_USERNAME
     
-    if update.new_chat_member and update.new_chat_member.user.id == me.id:
-        # Bot was just added
-        if update.new_chat_member.status in ["administrator", "member"]:
-            chat = update.chat
-            log.info(f"🆕 Bot added to new chat: {chat.title} ({chat.id})")
-            
-            # Wait a moment for permissions to propagate
-            await asyncio.sleep(2)
-            
-            # Clear all pending requests
-            approved = await clear_pending_requests(client, chat.id, chat.title)
-            
-            if approved > 0:
-                log.info(f"🎊 Auto-cleared {approved} pending requests after being added to {chat.title}")
+    # 1. Set BOT_USERNAME once
+    if not BOT_USERNAME:
+        try:
+            me = await client.get_me()
+            BOT_USERNAME = me.username
+            log.info(f"Bot Username set to: @{BOT_USERNAME}")
+        except Exception:
+             pass 
+
+    # 2. Start the background task only once
+    if not client._cleaner_task_started:
+        log.info("Starting initial checks and background pending requests cleaner task...")
+        # Start the task but don't wait for it
+        asyncio.create_task(pending_requests_cleaner(client))
+        client._cleaner_task_started = True
+        log.info("Background pending cleaner task started successfully.")
+    
+    # Optional: Prevent filters.me from spamming the console for status checks
+    if message.command and message.command[0] in ["start", "status"]:
+        return
 
 
-# ---------------- Handlers ---------------- #
+# ---------------- Handlers (Unchanged for Functionality) ---------------- #
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     user = message.from_user
     if not user:
         return
 
+    # add to DB
     USER_DATABASE.add(user.id)
     log.info(f"🆕 /start from {user.id} — added to USER_DATABASE (count={len(USER_DATABASE)})")
 
     try:
-        global BOT_USERNAME
-        if not BOT_USERNAME:
-            me = await client.get_me()
-            BOT_USERNAME = me.username
-            
+        me = await client.get_me()
+        bot_username_local = me.username or None
         await message.reply_text(
             START_MESSAGE.format(user_name=user.first_name or "User"),
-            reply_markup=build_start_keyboard(BOT_USERNAME),
+            reply_markup=build_start_keyboard(bot_username_local),
             disable_web_page_preview=True
         )
     except Exception as e:
@@ -364,38 +255,65 @@ async def start_handler(client: Client, message: Message):
 @app.on_callback_query(filters.regex(r"^status_check$"))
 async def status_checker(client: Client, callback_query):
     await callback_query.answer(
-        f"🚀 Bot Active | Users: {len(USER_DATABASE)} | Cleaner: {app._cleaner_task_started} | Processed Chats: {len(PROCESSED_CHATS)}",
+        f"🚀 Bot Active | Total Users Tracked: {len(USER_DATABASE)} | Cleaner Active: {app._cleaner_task_started}",
         show_alert=True
     )
 
-
-# ---------------- Auto-Approve New Join Requests (Instant) ---------------- #
+# ----------------------------------------------
+## Auto-Approve Join Requests (Universal & Instant)
+# ----------------------------------------------
 @app.on_chat_join_request()
 async def auto_approve(client: Client, req: ChatJoinRequest):
+    # Logic remains robust for instant approval of *new* requests.
     user = req.from_user
     chat = req.chat
 
     if AUTO_APPROVE_CHAT_ID and chat.id != AUTO_APPROVE_CHAT_ID:
-        log.debug(f"Ignoring join request from chat {chat.id} (not configured)")
+        log.debug(f"Ignoring join request from chat {chat.id} because AUTO_APPROVE_CHAT_ID is set and doesn't match.")
         return
 
-    log.info(f"➡️ Processing NEW join request: {user.first_name} ({user.id}) -> {chat.title}")
+    log.info(f"➡️ Processing INSTANT join request: user={user.id} chat={chat.id}")
+    request_key = (chat.id, user.id)
+    PENDING_REQUESTS[request_key] = time.time()
 
-    success = await approve_request_with_dm(
-        client,
-        chat.id,
-        user.id,
-        user.first_name or "User",
-        chat.title or "this chat"
-    )
-    
-    if not success:
-        log.warning(f"⚠️ Failed to approve {user.id} in {chat.id}")
+    USER_DATABASE.add(user.id)
+
+    try:
+        await req.approve()
+        PENDING_REQUESTS.pop(request_key, None)
+        log.info(f"✅ Approved INSTANT join request: {user.id} -> {chat.title}")
+    except RPCError as e:
+        log.error(f"❌ RPCError while approving {user.id} for chat {chat.id}: {e} (Check 'Manage Invite Links' permission)")
+        return
+    except Exception as e:
+        log.error(f"❌ Unexpected error while approving join request: {e}")
+        return
+
+    # Try sending private welcome message
+    try:
+        me = await client.get_me()
+        bot_username_local = me.username or BOT_USERNAME or None
+        await client.send_message(
+            user.id,
+            WELCOME_TEXT.format(user_name=user.first_name or "Friend", chat_title=chat.title or "this chat", mandatory_channel=MANDATORY_CHANNEL),
+            reply_markup=get_welcome_keyboard(chat, bot_username_local)
+        )
+        log.info(f"✉️ Sent welcome PM to {user.id}")
+    except (PeerIdInvalid, UserIsBlocked, UserNotParticipant):
+        log.info(f"⚠️ Could not PM user {user.id} — sending a fallback message to the chat.")
+        try:
+            mention = user.mention if hasattr(user, "mention") else f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
+            await client.send_message(chat.id, f"Welcome {mention}! ✅", parse_mode="html")
+        except Exception as e:
+            log.debug(f"Failed to send fallback chat message in {chat.id}: {e}")
+    except Exception as e:
+        log.warning(f"⚠️ Failed to send PM to {user.id}: {e}")
 
 
 # ---------------- Manual approve command (admins only) ---------------- #
 @app.on_message(filters.command("approve") & filters.group)
 async def manual_approve_handler(client: Client, message: Message):
+    # This command remains useful for manual quick fixes.
     if not await is_admin_or_creator(client, message.chat.id, message.from_user.id):
         await message.reply_text("⛔ Yeh command sirf admins ke liye hai.")
         return
@@ -410,44 +328,36 @@ async def manual_approve_handler(client: Client, message: Message):
         return
 
     try:
+        await client.approve_chat_join_request(message.chat.id, target_user_id)
+        PENDING_REQUESTS.pop((message.chat.id, target_user_id), None)
         approved_user = await client.get_users(target_user_id)
-        success = await approve_request_with_dm(
-            client,
-            message.chat.id,
-            target_user_id,
-            approved_user.first_name or "User",
-            message.chat.title
-        )
-        
-        if success:
-            await message.reply_text(f"✅ {approved_user.first_name} ({approved_user.id}) approved!")
-        else:
-            await message.reply_text(f"⚠️ Could not approve {target_user_id}")
+        await message.reply_text(f"✅ {approved_user.first_name} ({approved_user.id}) ko approve kar diya gaya.")
+        USER_DATABASE.add(target_user_id)
 
+        # Try to PM
+        try:
+            me = await client.get_me()
+            bot_username_local = me.username or BOT_USERNAME or None
+            await client.send_message(
+                target_user_id,
+                WELCOME_TEXT.format(user_name=approved_user.first_name or "Friend", chat_title=message.chat.title, mandatory_channel=MANDATORY_CHANNEL),
+                reply_markup=get_welcome_keyboard(message.chat, bot_username_local)
+            )
+        except Exception as e:
+            log.debug(f"Could not send PM after manual approval to {target_user_id}: {e}")
+
+    except RPCError as e:
+        await message.reply_text(f"❌ Approval failed (RPCError): {e}")
     except Exception as e:
-        await message.reply_text(f"❌ Error: {e}")
-
-
-# ---------------- Clear Command (admins only) ---------------- #
-@app.on_message(filters.command("clear") & filters.group)
-async def clear_command_handler(client: Client, message: Message):
-    """Admin command to manually clear all pending requests."""
-    if not await is_admin_or_creator(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ Yeh command sirf admins ke liye hai.")
-        return
-    
-    status_msg = await message.reply_text("🧹 Clearing all pending requests...")
-    
-    approved = await clear_pending_requests(client, message.chat.id, message.chat.title)
-    
-    await status_msg.edit_text(f"✅ Cleared {approved} pending requests!")
+        await message.reply_text(f"❌ Approval failed: {e}")
 
 
 # ---------------- Broadcast (developer only) ---------------- #
 @app.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_handler(client: Client, message: Message):
+    # This remains unchanged.
     if not DEVELOPER_ID:
-        await message.reply_text("⚠️ Broadcasting is disabled (DEVELOPER_ID not configured).")
+        await message.reply_text("⚠️ Broadcasting is disabled on this bot (DEVELOPER_ID not configured).")
         return
 
     if message.from_user.id != DEVELOPER_ID:
@@ -460,7 +370,7 @@ async def broadcast_handler(client: Client, message: Message):
 
     broadcast_message = message.reply_to_message
     total = len(USER_DATABASE)
-    await message.reply_text(f"🚀 Broadcast starting — {total} users")
+    await message.reply_text(f"🚀 Broadcast shuru ho raha hai — {total} users ko bheja jayega.")
 
     sent = 0
     failed = 0
@@ -477,63 +387,34 @@ async def broadcast_handler(client: Client, message: Message):
                 sent += 1
             except Exception:
                 failed += 1
-        except (UserIsBlocked, UserNotParticipant, PeerIdInvalid, RPCError):
+        except (UserIsBlocked, UserNotParticipant, PeerIdInvalid, RPCError) as e:
             USER_DATABASE.discard(uid)
             failed += 1
         except Exception as e:
             log.error(f"Error broadcasting to {uid}: {e}")
             failed += 1
 
-    await message.reply_text(f"✅ Broadcast complete. Sent: {sent}, Failed: {failed}")
+    await message.reply_text(f"✅ Broadcast complete. Sent: {sent}, Failed/Removed: {failed}, Current tracked: {len(USER_DATABASE)}")
 
 
-# ---------------- Startup Function ---------------- #
-async def start_bot_and_tasks():
-    """Start bot and initialize all background tasks."""
-    global BOT_USERNAME
-    
-    # 1. Start client
-    await app.start()
-    log.info("✅ Client connected to Telegram")
-    
-    # 2. Set bot username
-    me = await app.get_me()
-    BOT_USERNAME = me.username
-    log.info(f"🤖 Bot Username: @{BOT_USERNAME}")
-
-    # 3. Start background cleaner task
-    if not app._cleaner_task_started:
-        log.info("🚀 Starting background cleaner task...")
-        asyncio.create_task(pending_requests_cleaner(app))
-        app._cleaner_task_started = True
-        log.info("✅ Background cleaner task started successfully")
-
-    # 4. Optional: Clear pending requests from configured channel on startup
-    if AUTO_APPROVE_CHAT_ID:
-        log.info(f"🧹 Performing initial cleanup for configured chat: {AUTO_APPROVE_CHAT_ID}")
-        await clear_pending_requests(app, AUTO_APPROVE_CHAT_ID)
-
-    # Keep bot running
-    await app.idle()
-
-
-# ---------------- Run FastAPI ---------------- #
+# ---------------- Run ---------------- #
 def run_fastapi():
-    """FastAPI health check server in separate thread."""
+    """FastAPI health check server ko separate thread mein chalaata hai."""
     uvicorn.run(web_app, host="0.0.0.0", port=WEB_PORT, log_level="info")
 
 
-# ---------------- Main Entry Point ---------------- #
 if __name__ == "__main__":
-    log.info("🚀 Starting Ultra Auto-Approver Bot")
+    log.info("🚀 Starting Bot — FastAPI healthcheck + Pyrogram bot")
 
-    # Start health check server in background
+    # Start health check server in background thread
     threading.Thread(target=run_fastapi, daemon=True).start()
 
-    # Run Pyrogram bot
+    # Run pyrogram (blocks) - FIX: app.idle() ki jagah blocking app.run() ka istemal kiya gaya hai.
     try:
-        asyncio.run(start_bot_and_tasks())
+        log.info("Client is starting now...")
+        # app.run() client ko start karta hai aur use tab tak chalu rakhta hai (app.idle() ka kaam karta hai)
+        app.run()
     except KeyboardInterrupt:
         log.info("⌛ Shutting down (KeyboardInterrupt)")
     except Exception as e:
-        log.error(f"🔥 Fatal error: {e}")
+        log.error(f"🔥 Fatal error running pyrogram client: {e}")
