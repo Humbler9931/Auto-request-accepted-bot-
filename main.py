@@ -170,7 +170,7 @@ async def pending_requests_cleaner(client: Client):
                         chats_to_check.add(dialog.chat.id)
                 log.info(f"Found {len(chats_to_check)} active chats/channels to check for old requests.")
             except RPCError as e:
-                # FIX: RPCError handling improved here. CHAT_WRITE_FORBIDDEN error ko yahan handle kiya gaya hai.
+                # Handle errors during dialog fetching
                 if "CHAT_WRITE_FORBIDDEN" in str(e):
                     log.warning(f"⚠️ RPCError getting dialogs (Likely a forbidden chat/channel): {e}. Skipping check and continuing.")
                 else:
@@ -199,9 +199,12 @@ async def pending_requests_cleaner(client: Client):
             except FloodWait as fw:
                 log.warning(f"⏳ FloodWait during cleaner for {chat_id}: sleeping {fw.value}s")
                 await asyncio.sleep(fw.value)
+            except (PeerIdInvalid, UserNotParticipant) as e:
+                # <-- FIX: Added specific checks for Permission/Peer errors here
+                log.error(f"❌ PERMISSION ISSUE in chat {chat_id}: Bot lacks 'Manage Invite Links' permission or is not a member. Details: {e}")
             except RPCError as e:
-                # Bot might have lost 'Manage Invite Links' permission in this chat
-                log.debug(f"⚠️ RPCError while auto-cleaning {chat_id}: {e}")
+                # Catch general RPC errors here
+                log.error(f"⚠️ RPCError while auto-cleaning {chat_id}: {e}")
             except Exception as e:
                 log.error(f"❌ Unexpected error in auto-cleaner for {chat_id}: {e}")
 
@@ -218,7 +221,6 @@ async def pending_requests_cleaner(client: Client):
 async def startup_cleaner_scheduler(client: Client, message: Message):
     """
     Ensures global BOT_USERNAME is set and the background cleaner task starts only once.
-    This fires when the bot is initialized and sends its first message.
     """
     global BOT_USERNAME
     
@@ -234,12 +236,10 @@ async def startup_cleaner_scheduler(client: Client, message: Message):
     # 2. Start the background task only once
     if not client._cleaner_task_started:
         log.info("Starting initial checks and GUARANTEED background pending requests cleaner task...")
-        # Start the task but don't wait for it
         asyncio.create_task(pending_requests_cleaner(client))
         client._cleaner_task_started = True
         log.info("Background pending cleaner task started successfully.")
     
-    # Optional: Prevent filters.me from spamming the console for status checks
     if message.command and message.command[0] in ["start", "status"]:
         return
 
@@ -251,7 +251,6 @@ async def start_handler(client: Client, message: Message):
     if not user:
         return
 
-    # add to DB
     USER_DATABASE.add(user.id)
     log.info(f"🆕 /start from {user.id} — added to USER_DATABASE (count={len(USER_DATABASE)})")
 
@@ -279,7 +278,6 @@ async def status_checker(client: Client, callback_query):
 # ----------------------------------------------
 @app.on_chat_join_request()
 async def auto_approve(client: Client, req: ChatJoinRequest):
-    # This handles all NEW requests instantly.
     user = req.from_user
     chat = req.chat
 
@@ -328,7 +326,6 @@ async def auto_approve(client: Client, req: ChatJoinRequest):
 # ---------------- Manual approve command (admins only) ---------------- #
 @app.on_message(filters.command("approve") & filters.group)
 async def manual_approve_handler(client: Client, message: Message):
-    # This command remains useful for manual quick fixes.
     if not await is_admin_or_creator(client, message.chat.id, message.from_user.id):
         await message.reply_text("⛔ Yeh command sirf admins ke liye hai.")
         return
@@ -349,7 +346,6 @@ async def manual_approve_handler(client: Client, message: Message):
         await message.reply_text(f"✅ {approved_user.first_name} ({approved_user.id}) ko approve kar diya gaya.")
         USER_DATABASE.add(target_user_id)
 
-        # Try to PM
         try:
             me = await client.get_me()
             bot_username_local = me.username or BOT_USERNAME or None
@@ -370,7 +366,6 @@ async def manual_approve_handler(client: Client, message: Message):
 # ---------------- Broadcast (developer only) ---------------- #
 @app.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_handler(client: Client, message: Message):
-    # This remains unchanged.
     if not DEVELOPER_ID:
         await message.reply_text("⚠️ Broadcasting is disabled on this bot (DEVELOPER_ID not configured).")
         return
