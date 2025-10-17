@@ -69,6 +69,7 @@ app = Client(
 
 app._cleaner_task_started = False
 
+
 # ---------------- FastAPI Health-check ---------------- #
 web_app = FastAPI()
 
@@ -76,13 +77,13 @@ web_app = FastAPI()
 @web_app.get("/")
 def home():
     """Health check for external pinger services (like UptimeRobot)."""
-    # Note: Accessing app._cleaner_task_started here is safe because it's set before the main app.run() loop starts its worker threads.
     return {
         "status": "✅ Bot is Running (via FastAPI)",
         "auto_approve_chat_id": AUTO_APPROVE_CHAT_ID or "ALL (Using Safe Dialog Check)",
         "users_tracked": len(USER_DATABASE),
         "cleaner_task_active": app._cleaner_task_started
     }
+
 
 # ---------------- Helper Functions ---------------- #
 async def is_admin_or_creator(client: Client, chat_id: int, user_id: int) -> bool:
@@ -142,13 +143,14 @@ def get_welcome_keyboard(chat: Chat, bot_username: Optional[str]) -> InlineKeybo
 async def pending_requests_cleaner(client: Client):
     """
     Background task to check and clear already pending requests periodically (every 5 mins).
-    This handles requests that arrived while the bot was offline or asleep (due to Render).
+    This handles requests that arrived while the bot was offline or asleep.
     """
     global BOT_USERNAME
     
+    # Wait for a short moment after startup to ensure everything is initialized
+    await asyncio.sleep(15) 
+
     while True:
-        # Wait 5 minutes. This delay is non-blocking.
-        await asyncio.sleep(300)
         log.info("🧹 Starting scheduled check for already pending requests...")
         
         chats_to_check: Set[int] = set()
@@ -162,9 +164,10 @@ async def pending_requests_cleaner(client: Client):
             try:
                 # Fetch recent 500 dialogs to find potential target chats
                 async for dialog in client.get_dialogs(limit=500):
+                    # NOTE: Only supergroup/channel types can have join requests
                     if dialog.chat.type in ["channel", "supergroup"]:
                         chats_to_check.add(dialog.chat.id)
-                log.info(f"Found {len(chats_to_check)} active chats/channels to check.")
+                log.info(f"Found {len(chats_to_check)} active chats/channels to check for old requests.")
             except Exception as e:
                 log.error(f"Error getting dialogs for cleaner: {e}")
 
@@ -175,6 +178,7 @@ async def pending_requests_cleaner(client: Client):
             
             try:
                 # Get and approve up to 50 pending requests per cycle per chat
+                # This call fetches old/missed requests!
                 async for req in client.get_chat_join_requests(chat_id, limit=50):
                     await client.approve_chat_join_request(chat_id, req.user.id)
                     USER_DATABASE.add(req.user.id)
@@ -197,13 +201,17 @@ async def pending_requests_cleaner(client: Client):
             log.info(f"🎉 Scheduled check finished. Total approved: {total_approved}")
         else:
             log.info("🧹 Scheduled check finished. No pending requests found.")
+            
+        # Wait 5 minutes before the next check. This delay is non-blocking.
+        await asyncio.sleep(300)
 
-# ---------------- Startup Hook ---------------- #
-@app.on_message(filters.me)
+# ---------------- Startup Hook (Cleaned-up for immediate start) ---------------- #
+# We use on_message handler on a dummy message to simulate Pyrogram's on_ready/on_start
+@app.on_message(filters.regex(".*", re.IGNORECASE) & filters.me)
 async def startup_cleaner_scheduler(client: Client, message: Message):
     """
     Ensures global BOT_USERNAME is set and the background cleaner task starts only once.
-    This fires when the bot receives its own messages (filters.me) or sends its first message.
+    This fires when the bot is initialized and sends its first message (optional) or receives a /start (filters.me used for simplicity).
     """
     global BOT_USERNAME
     
@@ -218,7 +226,7 @@ async def startup_cleaner_scheduler(client: Client, message: Message):
 
     # 2. Start the background task only once
     if not client._cleaner_task_started:
-        log.info("Starting initial checks and background pending requests cleaner task...")
+        log.info("Starting initial checks and GUARANTEED background pending requests cleaner task...")
         # Start the task but don't wait for it
         asyncio.create_task(pending_requests_cleaner(client))
         client._cleaner_task_started = True
@@ -227,7 +235,6 @@ async def startup_cleaner_scheduler(client: Client, message: Message):
     # Optional: Prevent filters.me from spamming the console for status checks
     if message.command and message.command[0] in ["start", "status"]:
         return
-
 
 # ---------------- Handlers (Unchanged for Functionality) ---------------- #
 @app.on_message(filters.command("start") & filters.private)
@@ -264,7 +271,7 @@ async def status_checker(client: Client, callback_query):
 # ----------------------------------------------
 @app.on_chat_join_request()
 async def auto_approve(client: Client, req: ChatJoinRequest):
-    # Logic remains robust for instant approval of *new* requests.
+    # This handles all NEW requests instantly.
     user = req.from_user
     chat = req.chat
 
@@ -409,10 +416,9 @@ if __name__ == "__main__":
     # Start health check server in background thread
     threading.Thread(target=run_fastapi, daemon=True).start()
 
-    # Run pyrogram (blocks) - FIX: app.idle() ki jagah blocking app.run() ka istemal kiya gaya hai.
+    # Run pyrogram (blocks) - app.run() will start the client and keep it running (handling app.idle()).
     try:
         log.info("Client is starting now...")
-        # app.run() client ko start karta hai aur use tab tak chalu rakhta hai (app.idle() ka kaam karta hai)
         app.run()
     except KeyboardInterrupt:
         log.info("⌛ Shutting down (KeyboardInterrupt)")
