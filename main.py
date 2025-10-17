@@ -6,6 +6,7 @@ import sys
 import time
 import threading
 from typing import Dict, Optional, Set, Tuple
+import re  # <-- FIX 1: New Error Fix: Import 're' for re.IGNORECASE
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
@@ -205,13 +206,14 @@ async def pending_requests_cleaner(client: Client):
         # Wait 5 minutes before the next check. This delay is non-blocking.
         await asyncio.sleep(300)
 
-# ---------------- Startup Hook (Cleaned-up for immediate start) ---------------- #
-# We use on_message handler on a dummy message to simulate Pyrogram's on_ready/on_start
+# ---------------- Startup Hook (Ensures Cleaner Starts Immediately) ---------------- #
+# This uses a simple filter that is guaranteed to be triggered by a bot's own message (like /start)
+# and now includes the correct 're' import.
 @app.on_message(filters.regex(".*", re.IGNORECASE) & filters.me)
 async def startup_cleaner_scheduler(client: Client, message: Message):
     """
     Ensures global BOT_USERNAME is set and the background cleaner task starts only once.
-    This fires when the bot is initialized and sends its first message (optional) or receives a /start (filters.me used for simplicity).
+    This fires when the bot is initialized and sends its first message.
     """
     global BOT_USERNAME
     
@@ -235,6 +237,7 @@ async def startup_cleaner_scheduler(client: Client, message: Message):
     # Optional: Prevent filters.me from spamming the console for status checks
     if message.command and message.command[0] in ["start", "status"]:
         return
+
 
 # ---------------- Handlers (Unchanged for Functionality) ---------------- #
 @app.on_message(filters.command("start") & filters.private)
@@ -407,6 +410,7 @@ async def broadcast_handler(client: Client, message: Message):
 # ---------------- Run ---------------- #
 def run_fastapi():
     """FastAPI health check server ko separate thread mein chalaata hai."""
+    # Note: host="0.0.0.0" is essential for deployment environments like Render.
     uvicorn.run(web_app, host="0.0.0.0", port=WEB_PORT, log_level="info")
 
 
@@ -416,7 +420,7 @@ if __name__ == "__main__":
     # Start health check server in background thread
     threading.Thread(target=run_fastapi, daemon=True).start()
 
-    # Run pyrogram (blocks) - app.run() will start the client and keep it running (handling app.idle()).
+    # Run pyrogram (blocks) - app.run() client को शुरू करता है और इसे चालू रखता है।
     try:
         log.info("Client is starting now...")
         app.run()
