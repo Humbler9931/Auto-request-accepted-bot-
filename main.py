@@ -6,7 +6,7 @@ import sys
 import time
 import threading
 from typing import Dict, Optional, Set, Tuple
-import re  # <-- FIX 1: New Error Fix: Import 're' for re.IGNORECASE
+import re
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
@@ -169,8 +169,15 @@ async def pending_requests_cleaner(client: Client):
                     if dialog.chat.type in ["channel", "supergroup"]:
                         chats_to_check.add(dialog.chat.id)
                 log.info(f"Found {len(chats_to_check)} active chats/channels to check for old requests.")
+            except RPCError as e:
+                # FIX: RPCError handling improved here. CHAT_WRITE_FORBIDDEN error ko yahan handle kiya gaya hai.
+                if "CHAT_WRITE_FORBIDDEN" in str(e):
+                    log.warning(f"⚠️ RPCError getting dialogs (Likely a forbidden chat/channel): {e}. Skipping check and continuing.")
+                else:
+                    log.error(f"❌ Critical RPCError getting dialogs for cleaner: {e}")
             except Exception as e:
-                log.error(f"Error getting dialogs for cleaner: {e}")
+                log.error(f"❌ Unexpected error getting dialogs for cleaner: {e}")
+
 
         # Process pending requests for each identified chat
         total_approved = 0
@@ -207,8 +214,6 @@ async def pending_requests_cleaner(client: Client):
         await asyncio.sleep(300)
 
 # ---------------- Startup Hook (Ensures Cleaner Starts Immediately) ---------------- #
-# This uses a simple filter that is guaranteed to be triggered by a bot's own message (like /start)
-# and now includes the correct 're' import.
 @app.on_message(filters.regex(".*", re.IGNORECASE) & filters.me)
 async def startup_cleaner_scheduler(client: Client, message: Message):
     """
@@ -410,7 +415,6 @@ async def broadcast_handler(client: Client, message: Message):
 # ---------------- Run ---------------- #
 def run_fastapi():
     """FastAPI health check server ko separate thread mein chalaata hai."""
-    # Note: host="0.0.0.0" is essential for deployment environments like Render.
     uvicorn.run(web_app, host="0.0.0.0", port=WEB_PORT, log_level="info")
 
 
@@ -420,7 +424,7 @@ if __name__ == "__main__":
     # Start health check server in background thread
     threading.Thread(target=run_fastapi, daemon=True).start()
 
-    # Run pyrogram (blocks) - app.run() client को शुरू करता है और इसे चालू रखता है।
+    # Run pyrogram (blocks)
     try:
         log.info("Client is starting now...")
         app.run()
